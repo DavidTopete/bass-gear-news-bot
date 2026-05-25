@@ -43,23 +43,40 @@ PALABRAS_EXCLUIDAS = [
 
 
 def cargar_historial():
-    if os.path.exists(ARCHIVO_HISTORIAL):
-        try:
-            with open(ARCHIVO_HISTORIAL, "r", encoding="utf-8") as archivo:
-                return json.load(archivo)
-        except Exception:
-            return []
-    return []
+    if not os.path.exists(ARCHIVO_HISTORIAL):
+        with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
+            json.dump([], archivo, ensure_ascii=False, indent=2)
+        return []
+
+    try:
+        with open(ARCHIVO_HISTORIAL, "r", encoding="utf-8") as archivo:
+            return json.load(archivo)
+    except Exception:
+        with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
+            json.dump([], archivo, ensure_ascii=False, indent=2)
+        return []
 
 
 def guardar_historial(historial):
-    with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
-        json.dump(historial[-1000:], archivo, ensure_ascii=False, indent=2)
+    try:
+        historial_limpio = list(dict.fromkeys(historial))
+
+        with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
+            json.dump(
+                historial_limpio[-1000:],
+                archivo,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        print("Error guardando historial:", error)
 
 
 def limpiar_html(texto):
     if not texto:
         return ""
+
     soup = BeautifulSoup(texto, "html.parser")
     return soup.get_text(" ", strip=True)
 
@@ -67,6 +84,7 @@ def limpiar_html(texto):
 def traducir(texto):
     if not texto:
         return ""
+
     try:
         return GoogleTranslator(source="auto", target="es").translate(texto)
     except Exception:
@@ -158,11 +176,14 @@ def obtener_noticias():
             })
 
             links_usados_en_esta_corrida.add(link)
+            print(f"Agregada noticia de {fuente['nombre']}")
             break
 
         time.sleep(1)
 
     if len(noticias) < TOTAL_NOTICIAS:
+        print("Faltan noticias. Buscando adicionales...")
+
         for fuente in FUENTES:
             if len(noticias) >= TOTAL_NOTICIAS:
                 break
@@ -202,6 +223,7 @@ def obtener_noticias():
                 })
 
                 links_usados_en_esta_corrida.add(link)
+                print(f"Agregada noticia adicional de {fuente['nombre']}")
 
             time.sleep(1)
 
@@ -229,11 +251,11 @@ def crear_mensaje_noticia(noticia):
 
 
 def main():
-    if not TOKEN or TOKEN == "PEGA_AQUI_TU_TOKEN":
+    if not TOKEN:
         print("Falta configurar TOKEN.")
         return
 
-    if not CHAT_ID or CHAT_ID == "PEGA_AQUI_TU_CHAT_ID":
+    if not CHAT_ID:
         print("Falta configurar CHAT_ID.")
         return
 
