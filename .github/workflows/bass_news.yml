@@ -2,11 +2,11 @@ name: Bass News Bot
 
 on:
   workflow_dispatch:
+
   schedule:
-    # 10:00 AM hora San Luis Río Colorado / Sonora
-    # Sonora = UTC-7
-    # 10:00 AM = 17:00 UTC
-    - cron: '0 17 * * *'
+    # 04:00 AM, 12:00 PM y 08:00 PM
+    # Hora San Luis Río Colorado / Sonora (UTC-7)
+    - cron: '0 11,19,3 * * *'
 
 permissions:
   contents: write
