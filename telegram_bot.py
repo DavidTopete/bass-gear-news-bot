@@ -44,33 +44,40 @@ PALABRAS_EXCLUIDAS = [
 
 def cargar_historial():
     if not os.path.exists(ARCHIVO_HISTORIAL):
+        print("No existe historial. Creando archivo nuevo...")
         with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
             json.dump([], archivo, ensure_ascii=False, indent=2)
         return []
 
     try:
         with open(ARCHIVO_HISTORIAL, "r", encoding="utf-8") as archivo:
-            return json.load(archivo)
-    except Exception:
+            historial = json.load(archivo)
+
+        if not isinstance(historial, list):
+            historial = []
+
+        print(f"Historial cargado: {len(historial)} noticias registradas")
+        return historial
+
+    except Exception as error:
+        print("Error leyendo historial. Reiniciando archivo:", error)
         with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
             json.dump([], archivo, ensure_ascii=False, indent=2)
         return []
 
 
 def guardar_historial(historial):
-    try:
-        historial_limpio = list(dict.fromkeys(historial))
+    historial_limpio = list(dict.fromkeys(historial))
 
-        with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
-            json.dump(
-                historial_limpio[-1000:],
-                archivo,
-                ensure_ascii=False,
-                indent=2
-            )
+    with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
+        json.dump(
+            historial_limpio[-2000:],
+            archivo,
+            ensure_ascii=False,
+            indent=2
+        )
 
-    except Exception as error:
-        print("Error guardando historial:", error)
+    print(f"Historial guardado: {len(historial_limpio[-2000:])} noticias")
 
 
 def limpiar_html(texto):
@@ -132,8 +139,7 @@ def enviar_encabezado():
     enviar_telegram(mensaje)
 
 
-def obtener_noticias():
-    historial = cargar_historial()
+def obtener_noticias(historial):
     links_usados_en_esta_corrida = set()
     noticias = []
 
@@ -160,6 +166,7 @@ def obtener_noticias():
                 continue
 
             if link in historial:
+                print(f"Repetida ignorada: {titulo_original}")
                 continue
 
             if link in links_usados_en_esta_corrida:
@@ -176,7 +183,7 @@ def obtener_noticias():
             })
 
             links_usados_en_esta_corrida.add(link)
-            print(f"Agregada noticia de {fuente['nombre']}")
+            print(f"Agregada: {titulo_original}")
             break
 
         time.sleep(1)
@@ -223,7 +230,7 @@ def obtener_noticias():
                 })
 
                 links_usados_en_esta_corrida.add(link)
-                print(f"Agregada noticia adicional de {fuente['nombre']}")
+                print(f"Agregada adicional: {titulo_original}")
 
             time.sleep(1)
 
@@ -260,10 +267,11 @@ def main():
         return
 
     historial = cargar_historial()
-    noticias = obtener_noticias()
+    noticias = obtener_noticias(historial)
 
     if not noticias:
-        print("No hay noticias nuevas.")
+        print("No hay noticias nuevas para enviar.")
+        guardar_historial(historial)
         return
 
     enviar_encabezado()
@@ -272,10 +280,12 @@ def main():
     for noticia in noticias:
         mensaje = crear_mensaje_noticia(noticia)
         enviar_telegram(mensaje)
-        historial.append(noticia["link"])
-        time.sleep(2)
 
-    guardar_historial(historial)
+        historial.append(noticia["link"])
+
+        guardar_historial(historial)
+
+        time.sleep(2)
 
     print(f"Total enviadas: {len(noticias)}")
 
