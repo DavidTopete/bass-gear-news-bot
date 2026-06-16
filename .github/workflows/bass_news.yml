@@ -1,13 +1,9 @@
-```yaml
 name: Bass News Bot
 
 on:
   workflow_dispatch:
 
   schedule:
-    # Ejecutar todos los días a las 10:00 AM
-    # Hora de San Luis Río Colorado / Sonora (UTC-7)
-    # 10:00 AM Sonora = 17:00 UTC
     - cron: '0 17 * * *'
 
 permissions:
@@ -44,10 +40,6 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-
           git add noticias_enviadas_bass.json
-
           git commit -m "Update bass news history" || echo "No changes"
-
           git push
-```
