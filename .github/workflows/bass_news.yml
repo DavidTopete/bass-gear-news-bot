@@ -1,49 +1,53 @@
+```yaml
 name: Bass News Bot
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
-schedule:
-# 10:00 AM hora San Luis Río Colorado / Sonora (UTC-7)
-# 10:00 AM = 17:00 UTC
-- cron: '0 17 * * *'
+  schedule:
+    # Ejecutar todos los días a las 10:00 AM
+    # Hora de San Luis Río Colorado / Sonora (UTC-7)
+    # 10:00 AM Sonora = 17:00 UTC
+    - cron: '0 17 * * *'
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-run-bot:
-runs-on: ubuntu-latest
+  run-bot:
+    runs-on: ubuntu-latest
 
-```
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  - name: Pull latest changes
-    run: |
-      git pull origin main || true
+      - name: Pull latest changes
+        run: |
+          git pull origin main || true
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-  - name: Install dependencies
-    run: |
-      pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
 
-  - name: Run Bass News Bot
-    env:
-      TOKEN: ${{ secrets.TOKEN }}
-      CHAT_ID: ${{ secrets.CHAT_ID }}
-    run: python telegram_bot.py
+      - name: Run Bass News Bot
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python telegram_bot.py
 
-  - name: Save bot history
-    run: |
-      git config user.name "github-actions"
-      git config user.email "github-actions@github.com"
-      git add noticias_enviadas_bass.json
-      git commit -m "Update bass news history" || echo "No changes to commit"
-      git push
+      - name: Save bot history
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add noticias_enviadas_bass.json
+
+          git commit -m "Update bass news history" || echo "No changes"
+
+          git push
 ```
