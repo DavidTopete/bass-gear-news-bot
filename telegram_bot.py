@@ -12,7 +12,7 @@ TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 ARCHIVO_HISTORIAL = "noticias_enviadas_bass.json"
-TOTAL_NOTICIAS = 10
+TOTAL_NOTICIAS = 5
 
 FUENTES = [
     {"nombre": "Bass Player Mexico", "rss": "https://bassplayermexico.com/feed/"},
