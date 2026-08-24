@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import html
 import time
@@ -7,7 +8,16 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 from datetime import datetime
-from deep_translator import GoogleTranslator
+
+# deep_translator es opcional: si falla la importación, el bot sigue
+# funcionando con el traductor HTTP directo (fallback).
+try:
+    from deep_translator import GoogleTranslator
+    DEEP_TRANSLATOR_DISPONIBLE = True
+except Exception as _error_import:  # ImportError u otros
+    GoogleTranslator = None
+    DEEP_TRANSLATOR_DISPONIBLE = False
+    _ERROR_IMPORT_TRADUCTOR = _error_import
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -28,7 +38,23 @@ TOTAL_NOTICIAS = 5
 MAX_LARGO_TITULO = 200
 MAX_LARGO_RESUMEN = 750
 
-HEADERS_RSS = {
+# Traducción
+IDIOMA_DESTINO = "es"
+LIMITE_CHARS_TRADUCTOR = 4500   # Google corta/rechaza por encima de ~5000
+MAX_INTENTOS_TRADUCCION = 3
+ESPERA_BASE_TRADUCCION = 2      # segundos (backoff exponencial: 2, 4, 8)
+URL_TRADUCTOR_HTTP = "https://translate.googleapis.com/translate_a/single"
+
+# Telegram
+LIMITE_TELEGRAM = 4096
+
+# Filtrado
+# Si es False, las palabras excluidas solo se evalúan sobre título + fuente,
+# no sobre el resumen (evita descartar notas de bajo que mencionan "drum",
+# "keyboard", etc. de pasada). Poner True para volver al comportamiento previo.
+APLICAR_EXCLUSIONES_A_RESUMEN = False
+
+HEADERS_HTTP = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -48,6 +74,9 @@ FUENTES = [
     {"nombre": "BassBuzz", "rss": "https://www.bassbuzz.com/feed/"},
     {"nombre": "MusicRadar Bass", "rss": "https://www.musicradar.com/rss/news/guitars/bass-guitars"}
 ]
+
+# Fuentes que ya publican en español (no requieren traducción)
+FUENTES_EN_ESPANOL = {"bass player mexico"}
 
 PALABRAS_CLAVE_BAJO = [
     "bass", "bassist", "bass guitar", "electric bass",
@@ -74,6 +103,9 @@ FIRMAS_ERROR_TRADUCCION = [
     "error 429",
     "<html", "<!doctype"
 ]
+
+# Estadísticas de la corrida (diagnóstico)
+STATS = {"traducciones_ok": 0, "traducciones_fallidas": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -112,17 +144,12 @@ def cargar_historial():
 
 
 def guardar_historial(historial):
-    historial_limpio = list(dict.fromkeys(historial))
+    historial_limpio = list(dict.fromkeys(historial))[-2000:]
 
     with open(ARCHIVO_HISTORIAL, "w", encoding="utf-8") as archivo:
-        json.dump(
-            historial_limpio[-2000:],
-            archivo,
-            ensure_ascii=False,
-            indent=2
-        )
+        json.dump(historial_limpio, archivo, ensure_ascii=False, indent=2)
 
-    log.info(f"Historial guardado: {len(historial_limpio[-2000:])} noticias")
+    log.info(f"Historial guardado: {len(historial_limpio)} noticias")
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +161,14 @@ def limpiar_html(texto):
         return ""
 
     soup = BeautifulSoup(texto, "html.parser")
-    return soup.get_text(" ", strip=True)
+    texto_plano = soup.get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", texto_plano).strip()
+
+
+def recortar(texto, maximo, sufijo="..."):
+    if not texto or len(texto) <= maximo:
+        return texto
+    return texto[:maximo].rstrip() + sufijo
 
 
 def _parece_error_de_traduccion(texto):
@@ -148,44 +182,179 @@ def _parece_error_de_traduccion(texto):
     return any(firma in texto_lower for firma in FIRMAS_ERROR_TRADUCCION)
 
 
-def traducir(texto, max_intentos=3, espera_base=2):
-    """Traduce con reintentos y backoff exponencial. Si todos los intentos
-    fallan o devuelven contenido inválido, retorna el texto original
-    (nunca basura/HTML de error)."""
-    if not texto:
+def _dividir_en_chunks(texto, limite=LIMITE_CHARS_TRADUCTOR):
+    """Divide el texto en bloques <= limite, cortando preferentemente
+    en fin de oración para no romper el contexto de traducción."""
+    if len(texto) <= limite:
+        return [texto]
+
+    oraciones = re.split(r"(?<=[.!?])\s+", texto)
+    chunks = []
+    actual = ""
+
+    for oracion in oraciones:
+        # Oración individual más larga que el límite: corte duro
+        while len(oracion) > limite:
+            if actual:
+                chunks.append(actual)
+                actual = ""
+            chunks.append(oracion[:limite])
+            oracion = oracion[limite:]
+
+        if not actual:
+            actual = oracion
+        elif len(actual) + 1 + len(oracion) <= limite:
+            actual = f"{actual} {oracion}"
+        else:
+            chunks.append(actual)
+            actual = oracion
+
+    if actual:
+        chunks.append(actual)
+
+    return chunks
+
+
+# --- Motores de traducción -------------------------------------------------
+
+def _motor_deep_translator(texto, source):
+    """Motor 1: librería deep_translator."""
+    if not DEEP_TRANSLATOR_DISPONIBLE:
+        raise RuntimeError("deep_translator no disponible")
+
+    resultado = GoogleTranslator(source=source, target=IDIOMA_DESTINO).translate(texto)
+
+    if not resultado or not str(resultado).strip():
+        raise ValueError("Respuesta vacía del traductor")
+
+    if _parece_error_de_traduccion(resultado):
+        raise ValueError("Respuesta con firma de error del servicio")
+
+    return str(resultado)
+
+
+def _motor_http_directo(texto):
+    """Motor 2 (fallback): endpoint público de Google Translate.
+    No depende de la versión de deep_translator ni de su parser HTML."""
+    parametros = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": IDIOMA_DESTINO,
+        "dt": "t",
+        "q": texto
+    }
+
+    respuesta = requests.get(
+        URL_TRADUCTOR_HTTP,
+        params=parametros,
+        headers=HEADERS_HTTP,
+        timeout=20
+    )
+    respuesta.raise_for_status()
+
+    datos = respuesta.json()
+    if not datos or not isinstance(datos, list) or not datos[0]:
+        raise ValueError("Payload de traducción inesperado")
+
+    partes = [fragmento[0] for fragmento in datos[0] if fragmento and fragmento[0]]
+    resultado = "".join(partes).strip()
+
+    if not resultado:
+        raise ValueError("Traducción HTTP vacía")
+
+    if _parece_error_de_traduccion(resultado):
+        raise ValueError("Traducción HTTP con firma de error")
+
+    return resultado
+
+
+def _traducir_bloque(texto):
+    """Traduce un bloque <= LIMITE_CHARS_TRADUCTOR probando, en orden:
+    deep_translator(source='en') -> deep_translator(source='auto') -> HTTP directo.
+    Cada estrategia con reintentos y backoff exponencial."""
+    estrategias = [
+        ("deep_translator[en]", lambda t: _motor_deep_translator(t, "en")),
+        ("deep_translator[auto]", lambda t: _motor_deep_translator(t, "auto")),
+        ("http_directo", _motor_http_directo),
+    ]
+
+    ultimo_error = None
+
+    for nombre, funcion in estrategias:
+        for intento in range(1, MAX_INTENTOS_TRADUCCION + 1):
+            try:
+                return funcion(texto)
+            except Exception as error:
+                ultimo_error = error
+                log.warning(
+                    f"Traducción fallida [{nombre}] intento "
+                    f"{intento}/{MAX_INTENTOS_TRADUCCION}: {error}"
+                )
+                if intento < MAX_INTENTOS_TRADUCCION:
+                    time.sleep(ESPERA_BASE_TRADUCCION * (2 ** (intento - 1)))
+
+    raise RuntimeError(f"Todas las estrategias de traducción fallaron: {ultimo_error}")
+
+
+def traducir(texto, ya_en_espanol=False):
+    """Traduce al español respetando el límite de caracteres del servicio.
+    Si todo falla, retorna el texto original (nunca HTML de error)."""
+    if not texto or not texto.strip():
         return ""
 
-    for intento in range(1, max_intentos + 1):
+    if ya_en_espanol:
+        return texto
+
+    chunks = _dividir_en_chunks(texto)
+    traducidos = []
+
+    for indice, chunk in enumerate(chunks, start=1):
         try:
-            resultado = GoogleTranslator(source="auto", target="es").translate(texto)
-
-            if resultado and not _parece_error_de_traduccion(resultado):
-                return resultado
-
-            log.warning(
-                f"Traducción inválida (intento {intento}/{max_intentos}), "
-                f"se detectó firma de error del servicio."
-            )
-
+            traducidos.append(_traducir_bloque(chunk))
+            if len(chunks) > 1:
+                time.sleep(1)  # cortesía anti rate-limit entre bloques
         except Exception as error:
-            log.warning(f"Fallo de traducción (intento {intento}/{max_intentos}): {error}")
+            log.error(
+                f"No se pudo traducir el bloque {indice}/{len(chunks)} "
+                f"({len(chunk)} chars): {error}. Se usa texto original."
+            )
+            STATS["traducciones_fallidas"] += 1
+            return texto  # consistencia: no mezclar idiomas en un mismo campo
 
-        if intento < max_intentos:
-            time.sleep(espera_base * (2 ** (intento - 1)))  # 2s, 4s, 8s...
+    STATS["traducciones_ok"] += 1
+    return " ".join(traducidos).strip()
 
-    log.error("No se pudo traducir tras varios intentos. Se usa texto original.")
-    return texto
+
+def verificar_traductor():
+    """Prueba de humo al arranque: permite ver en el log si el problema
+    es el servicio de traducción y no el resto del pipeline."""
+    if not DEEP_TRANSLATOR_DISPONIBLE:
+        log.warning(
+            f"deep_translator no se pudo importar ({_ERROR_IMPORT_TRADUCTOR}). "
+            f"Se usará únicamente el traductor HTTP directo."
+        )
+
+    try:
+        prueba = _traducir_bloque("The bass player recorded a new album.")
+        log.info(f"Autotest de traducción OK -> '{prueba}'")
+        return True
+    except Exception as error:
+        log.error(f"Autotest de traducción FALLIDO: {error}")
+        return False
 
 
 def es_contenido_de_bajo(titulo, resumen, fuente):
-    contenido = f"{titulo} {resumen} {fuente}".lower()
+    base_exclusion = f"{titulo} {fuente}".lower()
+    if APLICAR_EXCLUSIONES_A_RESUMEN:
+        base_exclusion = f"{base_exclusion} {resumen}".lower()
 
-    if any(palabra in contenido for palabra in PALABRAS_EXCLUIDAS):
+    if any(palabra in base_exclusion for palabra in PALABRAS_EXCLUIDAS):
         return False
 
     if "bass" in fuente.lower():
         return True
 
+    contenido = f"{titulo} {resumen} {fuente}".lower()
     return any(palabra in contenido for palabra in PALABRAS_CLAVE_BAJO)
 
 
@@ -197,6 +366,12 @@ def enviar_telegram(mensaje):
     """Envía un mensaje a Telegram. Retorna True solo si Telegram confirma
     la entrega (HTTP 2xx + ok:true en el payload)."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+    if len(mensaje) > LIMITE_TELEGRAM:
+        log.warning(
+            f"Mensaje de {len(mensaje)} chars excede el límite de Telegram. Se recorta."
+        )
+        mensaje = mensaje[:LIMITE_TELEGRAM - 3] + "..."
 
     try:
         respuesta = requests.post(
@@ -236,7 +411,7 @@ def enviar_encabezado():
         f"<b>Fecha:</b> {fecha}"
     )
 
-    enviar_telegram(mensaje)
+    return enviar_telegram(mensaje)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +422,7 @@ def _parsear_feed(url):
     """Descarga el feed con User-Agent explícito antes de parsearlo,
     para evitar feeds vacíos por bloqueo silencioso del servidor."""
     try:
-        respuesta = requests.get(url, headers=HEADERS_RSS, timeout=15)
+        respuesta = requests.get(url, headers=HEADERS_HTTP, timeout=15)
         respuesta.raise_for_status()
         return feedparser.parse(respuesta.content)
     except requests.exceptions.RequestException as error:
@@ -257,13 +432,15 @@ def _parsear_feed(url):
 
 def obtener_noticias(historial):
     historial_set = set(historial)
-    links_usados_en_esta_corrida = set()
+    links_usados = set()
     noticias = []
 
-    def _procesar_fuente(fuente, romper_en_primera):
+    def _procesar_feed(feed, fuente, romper_en_primera):
+        """feed y fuente se reciben como parámetros explícitos
+        (antes feed se tomaba del scope externo)."""
         for entrada in feed.entries:
             if len(noticias) >= TOTAL_NOTICIAS:
-                break
+                return
 
             titulo_original = limpiar_html(entrada.get("title", ""))
             resumen_original = limpiar_html(
@@ -274,10 +451,7 @@ def obtener_noticias(historial):
             if not titulo_original or not link:
                 continue
 
-            if link in historial_set:
-                continue
-
-            if link in links_usados_en_esta_corrida:
+            if link in historial_set or link in links_usados:
                 continue
 
             if not es_contenido_de_bajo(titulo_original, resumen_original, fuente["nombre"]):
@@ -290,11 +464,11 @@ def obtener_noticias(historial):
                 "link": link
             })
 
-            links_usados_en_esta_corrida.add(link)
+            links_usados.add(link)
             log.info(f"Agregada: {titulo_original}")
 
             if romper_en_primera:
-                break
+                return
 
     # Primera pasada: 1 noticia por fuente como máximo
     for fuente in FUENTES:
@@ -303,7 +477,7 @@ def obtener_noticias(historial):
 
         log.info(f"Revisando fuente: {fuente['nombre']}")
         feed = _parsear_feed(fuente["rss"])
-        _procesar_fuente(fuente, romper_en_primera=True)
+        _procesar_feed(feed, fuente, romper_en_primera=True)
         time.sleep(1)
 
     # Segunda pasada: completar cupo si faltan noticias
@@ -315,7 +489,7 @@ def obtener_noticias(historial):
                 break
 
             feed = _parsear_feed(fuente["rss"])
-            _procesar_fuente(fuente, romper_en_primera=False)
+            _procesar_feed(feed, fuente, romper_en_primera=False)
             time.sleep(1)
 
     return noticias[:TOTAL_NOTICIAS]
@@ -326,14 +500,19 @@ def obtener_noticias(historial):
 # ---------------------------------------------------------------------------
 
 def crear_mensaje_noticia(noticia):
-    titulo_es = traducir(noticia["titulo_original"])
-    resumen_es = traducir(noticia["resumen_original"])
+    fuente_es_espanol = noticia["fuente"].strip().lower() in FUENTES_EN_ESPANOL
 
-    if len(titulo_es) > MAX_LARGO_TITULO:
-        titulo_es = titulo_es[:MAX_LARGO_TITULO] + "..."
+    # Se recorta ANTES de traducir: evita rechazos por longitud y reduce
+    # el volumen enviado al servicio.
+    titulo_src = recortar(noticia["titulo_original"], MAX_LARGO_TITULO, sufijo="")
+    resumen_src = recortar(noticia["resumen_original"], MAX_LARGO_RESUMEN, sufijo="")
 
-    if len(resumen_es) > MAX_LARGO_RESUMEN:
-        resumen_es = resumen_es[:MAX_LARGO_RESUMEN] + "..."
+    titulo_es = traducir(titulo_src, ya_en_espanol=fuente_es_espanol)
+    resumen_es = traducir(resumen_src, ya_en_espanol=fuente_es_espanol)
+
+    # Recorte final: el español expande ~20-25% respecto al inglés.
+    titulo_es = recortar(titulo_es, MAX_LARGO_TITULO)
+    resumen_es = recortar(resumen_es, MAX_LARGO_RESUMEN)
 
     mensaje = (
         f"<b>{html.escape(titulo_es)}</b>\n"
@@ -360,6 +539,8 @@ def main():
     if not CHAT_ID:
         log.error("Falta configurar CHAT_ID.")
         return
+
+    verificar_traductor()
 
     historial = cargar_historial()
     noticias = obtener_noticias(historial)
@@ -393,6 +574,10 @@ def main():
         time.sleep(2)
 
     log.info(f"Total enviadas: {enviadas} | Total fallidas: {fallidas}")
+    log.info(
+        f"Traducciones OK: {STATS['traducciones_ok']} | "
+        f"Traducciones fallidas: {STATS['traducciones_fallidas']}"
+    )
 
 
 if __name__ == "__main__":
